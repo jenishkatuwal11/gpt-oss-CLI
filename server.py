@@ -1,50 +1,65 @@
 import http.server
 import socketserver
 import json
-from gpt_oss_cli.client import RouterClient
-from gpt_oss_cli.config import ClientSettings
+import os
+from urllib.parse import urlparse
 
-PORT = 8000
+# NOTE: this imports the single-file client you already updated
+from gpt_oss_cli import RouterClient, ClientSettings
 
-# Initialize the client (no need for API key or base_url now)
+PORT = int(os.getenv("PORT", "8000"))
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Read settings from .env if present; api_key is optional (no header sent if missing)
 settings = ClientSettings()
 client = RouterClient(settings)
 
-class ChatHandler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self):
-        # Get the content length and read the data
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
 
-        # Parse the data (message from the user)
-        data = json.loads(post_data)
-        user_message = data.get('message', '')
-
-        if user_message:
-            try:
-                # Get the FAQ answer based on the user question
-                response = client.get_faq_answer(user_message)
-                response_data = {'response': response}
-            except Exception as e:
-                response_data = {'error': str(e)}
-        else:
-            response_data = {'error': 'No message provided'}
-
-        # Send response back to the frontend
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(response_data).encode())
-
+class ChatHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        # Send the HTML file directly
-        with open("index.html", "rb") as file:
-            self.wfile.write(file.read())
+        # Serve index.html at /
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            self.path = "/index.html"
+        return super().do_GET()
 
-# Create and start the server
-with socketserver.TCPServer(("", PORT), ChatHandler) as httpd:
-    print(f"Server started at http://127.0.0.1:{PORT}")
-    httpd.serve_forever()
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/chat":
+            self.send_error(404, "Not Found")
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            return self._send_json({"error": "Invalid JSON"}, status=400)
+
+        user_message = (payload.get("message") or "").strip()
+        if not user_message:
+            return self._send_json({"error": "No message provided"}, status=400)
+
+        try:
+            # Uses the helper; internally it calls the same /chat/completions endpoint
+            reply = client.get_faq_answer(user_message)
+            self._send_json({"response": reply})
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+if __name__ == "__main__":
+    os.chdir(ROOT)  # ensure index.html is found
+    with socketserver.TCPServer(("", PORT), ChatHandler) as httpd:
+        print(f"Server started at http://127.0.0.1:{PORT}")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
